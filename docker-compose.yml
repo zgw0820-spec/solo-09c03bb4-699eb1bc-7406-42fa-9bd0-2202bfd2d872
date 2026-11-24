@@ -1,0 +1,24 @@
+# 收包进程换核演练
+#
+# 编排器与样例进程必须处在同一个 PID 命名空间里，编排器才能对样例进程
+# 调用 sched_setaffinity。因此这里用一个 drill 服务承载编排器，并由它在
+# 容器内拉起 DRILL_SAMPLES（2～4）个单线程样例进程；cpuset 定义“容器可用
+# 的逻辑 CPU”，也就是页面上的可选核池。
+services:
+  drill:
+    build: .
+    image: drill-rebind:local
+    ports:
+      - "8008:8008"
+    environment:
+      DRILL_SAMPLES: "3"
+      DRILL_HOST: "0.0.0.0"
+      DRILL_PORT: "8008"
+    # 容器可用 CPU 池。换机器时按实际 NUMA/核数调整；至少要比样例数多一颗，
+    # 否则互换类请求会按“走不通就不动”被拒绝。
+    cpuset: "0-5"
+    # 同容器内同 uid 的进程互调亲和性本不需要额外能力；显式加上 SYS_NICE，
+    # 以便镜像在启用更严格 seccomp/cap 策略的宿主机上也能设置亲和性。
+    cap_add:
+      - SYS_NICE
+    restart: unless-stopped

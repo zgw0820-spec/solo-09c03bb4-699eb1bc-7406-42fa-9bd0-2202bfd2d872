@@ -1,0 +1,9 @@
+.git/
+.deps/
+__pycache__/
+*.pyc
+vendor/*.whl
+tests/
+scripts/
+run/
+*.log

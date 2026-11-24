@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>收包进程换核演练</title>
+<style>{{ styles|safe }}</style>
+</head>
+<body>
+<header>
+  <h1>收包进程换核演练</h1>
+  <p class="sub">CPU 亲和性热换绑 · 单线程样例进程 · 不上停进程腾位置</p>
+</header>
+
+{% if flash %}
+<div class="flash">{{ flash }}</div>
+{% endif %}
+
+<section class="card">
+  <h2>容器可用逻辑 CPU</h2>
+  <p class="hint">可用 CPU 池：<code>{{ pool }}</code>；占用情况每 5 秒从 /proc 重读一次。
+    “空闲”表示当前没有样例进程绑定在该核上。</p>
+  <div class="cores">
+    {% for core in cores %}
+    <div class="core {{ 'used' if core.busy else 'free' }}">
+      <div class="cpu">CPU {{ core.cpu }}</div>
+      <div class="owner">{{ core.owner }}</div>
+      <div class="usage">负载 {{ core.usage if core.usage is not none else '—' }}%</div>
+    </div>
+    {% endfor %}
+  </div>
+</section>
+
+<section class="card">
+  <h2>样例进程与当前绑定（内核回读）</h2>
+  <table>
+    <thead>
+      <tr><th>样例</th><th>PID</th><th>线程</th><th>状态</th><th>绑定的核</th><th>每线程绑定</th><th>自述</th></tr>
+    </thead>
+    <tbody>
+      {% for sample in samples %}
+      <tr>
+        <td><strong>{{ sample.name }}</strong></td>
+        <td>{{ sample.pid }}</td>
+        <td>{{ sample.threads }}</td>
+        <td>{{ sample.state }}</td>
+        <td><span class="chip">{{ sample.cpus or '—' }}</span></td>
+        <td class="mono">
+          {% for t in sample.thread_cpus %}tid {{ t.tid }}: {{ t.cpus }}{% if not loop.last %}<br>{% endif %}{% endfor %}
+        </td>
+        <td><a class="link" href="{{ url_for('api_sample', name=sample.name) }}" target="_blank">查询样例</a></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p class="hint">“绑定的核”取自 <code>/proc/&lt;pid&gt;/status:Cpus_allowed_list</code>；
+    “查询样例”让样例进程自己再读一次 <code>/proc/self/status</code> 作为旁证。</p>
+</section>
+
+<section class="card">
+  <h2>提交一组目标核</h2>
+  <form method="post" action="{{ url_for('rebind') }}">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <table class="form">
+      <thead><tr><th>样例</th><th>当前核</th><th>目标核</th></tr></thead>
+      <tbody>
+        {% for sample in samples %}
+        <tr>
+          <td><strong>{{ sample.name }}</strong></td>
+          <td><span class="chip">{{ sample.cpus or '—' }}</span></td>
+          <td>
+            <select name="target_{{ sample.name }}">
+              {% for core in cores %}
+              <option value="{{ core.cpu }}" {% if sample.cpus == core.cpu|string %}selected{% endif %}>
+                CPU {{ core.cpu }}{% if core.owner == '空闲' %}（空闲）{% elif core.owner != sample.name %}（{{ core.owner }}）{% endif %}
+              </option>
+              {% endfor %}
+            </select>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    <div class="controls">
+      <label>故障注入
+        <input type="number" name="fail_at" min="1" step="1" placeholder="留空为不注入">
+      </label>
+      <span class="hint">填第 N 步：该步在写入亲和性<strong>之前</strong>报错，用于演练中途失败与回退。</span>
+      <button type="submit" {{ 'disabled' if session.busy else '' }}>提交这一组</button>
+    </div>
+    <p class="hint">每个样例只能选一颗核，且一组内不得重复；同一时刻只受理一组，上一组未结束时新提交会被拒绝。
+      需要互换核而池中又没有空闲核时，整组会被拒绝，不会改动任何进程。</p>
+  </form>
+</section>
+
+{% if last_job and last_job.plan %}
+<section class="card">
+  <h2>执行计划（第 {{ last_job.job_id }} 组）</h2>
+  <p class="mono">{{ last_job.plan }}</p>
+  <p class="hint">计划在写入前生成；每一步都保证所有样例各占一颗不同的核，环状互换可借用空闲核周转。</p>
+</section>
+{% endif %}
+
+{% if not last_job %}
+<section class="card">
+  <h2>每一步的内核回读</h2>
+  <p class="hint">还没有提交过换绑。提交一组目标核后，这里会逐步列出执行计划、
+    每一步之后从 <code>/proc/&lt;pid&gt;/status</code> 读回的绑定，以及中途失败时的回退步骤。</p>
+</section>
+{% endif %}
+
+{% if last_job %}
+<section class="card">
+  <h2>每一步的内核回读（第 {{ last_job.job_id }} 组）</h2>
+  <p class="result {{ last_job.result }}">
+    结果：
+    {% if last_job.result == 'applied' %}换绑完成
+    {% elif last_job.result == 'noop' %}无需换绑
+    {% elif last_job.result == 'rolled_back' %}中途失败，已恢复原绑定
+    {% elif last_job.result == 'rollback_failed' %}回退未完成，需人工处理
+    {% else %}未做改动{% endif %}
+    · {{ last_job.detail }}
+  </p>
+  {% if last_job.error and last_job.error != last_job.detail %}
+  <p class="hint mono">原因：{{ last_job.error }}</p>
+  {% endif %}
+  <table>
+    <thead>
+      <tr><th>步</th><th>样例</th><th>动作</th><th>状态</th><th>这一步之后各进程的绑定（内核回读）</th><th>说明</th></tr>
+    </thead>
+    <tbody>
+      {% for step in last_job.steps %}
+      <tr class="step-{{ step.status }}">
+        <td>{{ step.index }}</td>
+        <td><strong>{{ step.sample }}</strong></td>
+        <td>{{ step.source }} → {{ step.dest }} <span class="kind">{{ '借空闲核' if step.kind == 'borrow' else '直接换' }}</span></td>
+        <td>{{ '完成' if step.status == 'ok' else '失败' }}</td>
+        <td class="mono">{% for name, cpus in step.readback.items() %}{{ name }}={{ cpus }}{% if not loop.last %} · {% endif %}{% endfor %}</td>
+        <td>{{ step.detail }}</td>
+      </tr>
+      {% endfor %}
+      {% if not last_job.steps %}
+      <tr><td colspan="6" class="hint">没有执行任何步骤</td></tr>
+      {% endif %}
+    </tbody>
+  </table>
+
+  {% if last_job.rollback %}
+  <h3>回退步骤</h3>
+  <table>
+    <thead>
+      <tr><th>步</th><th>样例</th><th>动作</th><th>状态</th><th>这一步之后的绑定（内核回读）</th><th>说明</th></tr>
+    </thead>
+    <tbody>
+      {% for step in last_job.rollback %}
+      <tr class="step-{{ step.status }}">
+        <td>{{ step.index }}</td>
+        <td><strong>{{ step.sample }}</strong></td>
+        <td>{{ step.source }} → {{ step.dest }} <span class="kind">{{ '借空闲核' if step.kind == 'borrow' else '直接换' }}</span></td>
+        <td>{{ '完成' if step.status == 'ok' else '失败' }}</td>
+        <td class="mono">{% for name, cpus in step.readback.items() %}{{ name }}={{ cpus }}{% if not loop.last %} · {% endif %}{% endfor %}</td>
+        <td>{{ step.detail }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+
+  <p class="hint">最终绑定（内核回读）：<span class="mono">{% for name, cpus in last_job.bindings_after.items() %}{{ name }}={{ cpus }}{% if not loop.last %} · {% endif %}{% endfor %}</span></p>
+</section>
+{% endif %}
+
+{% if jobs|length > 1 %}
+<section class="card">
+  <h2>最近提交</h2>
+  <table>
+    <thead><tr><th>组</th><th>目标</th><th>结果</th><th>说明</th><th>最终绑定</th></tr></thead>
+    <tbody>
+      {% for job in jobs|reverse %}
+      <tr>
+        <td>{{ job.job_id }}</td>
+        <td class="mono">{% for name, cpu in job.target.items() %}{{ name }}→{{ cpu }}{% if not loop.last %} · {% endif %}{% endfor %}</td>
+        <td>{{ job.result }}</td>
+        <td>{{ job.detail }}</td>
+        <td class="mono">{% for name, cpus in job.bindings_after.items() %}{{ name }}={{ cpus }}{% if not loop.last %} · {% endif %}{% endfor %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endif %}
+
+<footer>
+  页面每 5 秒从 /proc 重新读取绑定；执行中不轮询，避免展示半步状态。
+</footer>
+{% if not flash %}
+<script>
+  // Auto-refresh only when no job is running, so the operator never sees a
+  // half-applied plan labelled as "current binding".  After a submission the
+  // page is left alone so the result message stays readable.
+  setTimeout(function () {
+    if (!document.querySelector('form button[disabled]')) { location.reload(); }
+  }, 5000);
+</script>
+{% endif %}
+</body>
+</html>
