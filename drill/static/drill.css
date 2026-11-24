@@ -98,4 +98,27 @@ tr.step-ok td { background: transparent; }
 .result.rolled_back { border-color: var(--warn); }
 .result.rollback_failed, .result.unchanged { border-color: var(--bad); }
 .link { color: var(--accent); }
+.query-btn {
+  padding: 5px 12px;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.requery-btn {
+  margin-top: 6px;
+  padding: 4px 12px;
+  font-size: 12px;
+}
+.query-result {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-radius: 7px;
+  border: 1px solid var(--line);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  max-width: 360px;
+}
+.query-result.ok { border-color: var(--ok); background: #12241a; }
+.query-result.retry { border-color: var(--warn); background: #2a2113; }
+.query-result.pending { border-color: var(--line); color: var(--muted); }
 footer { color: var(--muted); font-size: 12px; padding: 8px 0 24px; }

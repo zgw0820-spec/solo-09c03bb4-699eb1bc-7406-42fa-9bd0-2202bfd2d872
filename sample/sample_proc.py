@@ -10,8 +10,13 @@ affinity it reports comes from ``/proc/self/status`` (``Cpus_allowed_list``).
 
 Protocol (one JSON object per line on stdin, one per line on stdout):
 
-    {"cmd": "ping"}   -> {"ok": true, "pid": ..., "cpus": "...", ...}
-    {"cmd": "quit"}   -> {"ok": true} then exit
+    {"cmd": "ping", "req_id": "ab12..."}
+        -> {"ok": true, "req_id": "ab12...", "pid": ..., "cpus": "...", ...}
+    {"cmd": "quit", "req_id": "..."} -> {"ok": true, "req_id": "..."} then exit
+
+Every reply echoes the request's ``req_id`` so the orchestrator can match a
+reply to the exact request that triggered it and ignore a late reply left
+over from a request that already timed out.
 """
 
 from __future__ import annotations
@@ -138,16 +143,22 @@ def main() -> int:
             try:
                 request = json.loads(line)
             except json.JSONDecodeError:
+                # No request id can be recovered; the supervisor discards
+                # replies whose id does not match the request in flight.
                 _emit({"ok": False, "error": "bad json"})
                 continue
             command = request.get("cmd")
+            req_id = request.get("req_id")
             if command == "ping":
-                _emit(status())
+                reply = status()
             elif command == "quit":
-                _emit({"ok": True})
-                return 0
+                reply = {"ok": True}
             else:
-                _emit({"ok": False, "error": f"unknown command {command!r}"})
+                reply = {"ok": False, "error": f"unknown command {command!r}"}
+            reply["req_id"] = req_id
+            _emit(reply)
+            if command == "quit":
+                return 0
         if reader.closed:
             return 0
         if busy:

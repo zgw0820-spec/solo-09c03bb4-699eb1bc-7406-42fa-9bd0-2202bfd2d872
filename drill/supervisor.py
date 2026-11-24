@@ -4,6 +4,12 @@ Every sample is a separate process started by the orchestrator, with stdin
 and stdout wired to line-delimited JSON.  The sample reports its own
 ``Cpus_allowed_list`` from ``/proc/self/status``, so the orchestrator has a
 second, independent read path besides its own ``/proc/<pid>`` scan.
+
+Each request carries a freshly generated ``req_id`` which the sample echoes
+on its reply.  A reply is only accepted when its id matches the request in
+flight: a late reply to a request that already timed out stays in the queue
+and is drained (or skipped) instead of being mistaken for the next query's
+answer.
 """
 
 from __future__ import annotations
@@ -11,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import secrets
 import subprocess
 import sys
 import threading
@@ -53,9 +60,27 @@ class Sample:
 
     def ask(self, cmd: str = "ping", timeout: float = 2.0) -> dict:
         # Serialise request/response: the web app is threaded and two pages
-        # asking the same sample must not consume each other's answers.
+        # asking the same sample must not consume each other's answers.  The
+        # req_id match below makes a late answer harmless even across calls.
         with self._ask_lock:
             return self._ask_locked(cmd, timeout)
+
+    def _drain_stale(self) -> None:
+        """Remove answers left behind by earlier (e.g. timed-out) requests.
+
+        Runs while holding :attr:`_ask_lock`, so anything queued before a new
+        request belongs to an older request.  The channel-closed sentinel is
+        requeued so the next caller still observes a dead channel.
+        """
+
+        while True:
+            try:
+                message = self._lines.get_nowait()
+            except queue.Empty:
+                return
+            if message is None:
+                self._lines.put(None)
+                return
 
     def _ask_locked(self, cmd: str, timeout: float) -> dict:
         if self.process is None or self.process.stdin is None:
@@ -64,18 +89,28 @@ class Sample:
             raise SampleError(f"{self.name}: 进程 {self.pid} 已退出")
         if self.start_time is not None and kernel.process_starttime(self.pid) != self.start_time:
             raise SampleError(f"{self.name}: pid {self.pid} 已被系统复用")
+        self._drain_stale()
+        req_id = secrets.token_hex(8)
         try:
-            self.process.stdin.write(json.dumps({"cmd": cmd}) + "\n")
+            self.process.stdin.write(json.dumps({"cmd": cmd, "req_id": req_id}) + "\n")
             self.process.stdin.flush()
         except (BrokenPipeError, OSError) as exc:
             raise SampleError(f"{self.name}: 控制通道断开（{exc}）") from exc
-        try:
-            message = self._lines.get(timeout=timeout)
-        except queue.Empty as exc:
-            raise SampleError(f"{self.name}: 在 {timeout:.0f}s 内没有应答") from exc
-        if message is None:
-            raise SampleError(f"{self.name}: 控制通道已关闭")
-        return message
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise SampleError(f"{self.name}: 在 {timeout:.0f}s 内没有应答（请求 {req_id}）")
+            try:
+                message = self._lines.get(timeout=remaining)
+            except queue.Empty as exc:
+                raise SampleError(f"{self.name}: 在 {timeout:.0f}s 内没有应答（请求 {req_id}）") from exc
+            if message is None:
+                raise SampleError(f"{self.name}: 控制通道已关闭")
+            # Only the reply triggered by *this* request counts.  A late
+            # reply from an earlier request is skipped, never returned.
+            if message.get("req_id") == req_id:
+                return message
 
     def stop(self, timeout: float = 2.0) -> None:
         if self.process is None:

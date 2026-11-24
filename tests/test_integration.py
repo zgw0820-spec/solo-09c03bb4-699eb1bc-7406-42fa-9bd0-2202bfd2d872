@@ -7,6 +7,7 @@ skip automatically when the environment cannot provide a usable CPU pool.
 from __future__ import annotations
 
 import os
+import signal
 import threading
 import time
 import unittest
@@ -221,6 +222,193 @@ class ConcurrentSubmissionTests(unittest.TestCase):
         # must be a clean single-core mapping.
         self.assertTrue(_safe(after), after)
         self.assertIn("applied", results)
+
+
+def _get_json(client, path: str):
+    """Return (status_code, json_body) for a Flask test-client GET."""
+
+    response = client.get(path)
+    return response.status_code, response.get_json()
+
+
+class SampleQueryGuardTests(IntegrationBase):
+    """The /api/samples query entry must never report a torn or stale pair."""
+
+    def setUp(self):
+        super().setUp()
+        self.app = create_app(self.session)
+        self.client = self.app.test_client()
+        self.names = sorted(self.session.set.samples)
+
+    def _query(self, name: str):
+        return _get_json(self.client, f"/api/samples/{name}")
+
+    def _swap_target(self) -> dict[str, str]:
+        before = self.bindings()
+        target = dict(before)
+        target[self.names[0]], target[self.names[1]] = before[self.names[1]], before[self.names[0]]
+        return target
+
+    def test_quiet_query_matches_both_read_paths(self):
+        status, body = self._query(self.names[0])
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body["ok"], body)
+        self.assertTrue(body["consistent"], body)
+        self.assertTrue(body["req_id"])
+        self.assertEqual(body["cpus"], body["orchestrator_view"]["cpus"])
+
+    def test_query_while_a_job_is_executing_is_refused_at_entry(self):
+        self.session._executing = True
+        try:
+            status, body = self._query(self.names[0])
+        finally:
+            self.session._executing = False
+        self.assertEqual(status, 409, body)
+        self.assertTrue(body["retry"])
+        self.assertIn("重查", body["error"])
+
+    def test_rebind_started_while_waiting_for_sample_forces_requery(self):
+        if not hasattr(signal, "SIGSTOP"):
+            self.skipTest("平台不支持 SIGSTOP")
+        name = self.names[0]
+        pid = self.session.set.samples[name].pid
+        target = self._swap_target()
+        epoch_before = self.session.mutation_epoch()
+
+        os.kill(pid, signal.SIGSTOP)  # sample can neither answer nor exit
+        try:
+            holder = {}
+
+            def run_query():
+                holder["status"], holder["body"] = self._query(name)
+
+            thread = threading.Thread(target=run_query)
+            thread.start()
+            # Wait until the request is blocked inside the sample's ask().
+            deadline = time.monotonic() + 5
+            sample = self.session.set.samples[name]
+            while time.monotonic() < deadline and not sample._ask_lock.locked():
+                time.sleep(0.01)
+            self.assertTrue(sample._ask_lock.locked(), "查询没有进入等待样例应答的阶段")
+
+            job = self.session.submit(target)
+            self.assertEqual(job.result, "applied", job.error)
+        finally:
+            os.kill(pid, signal.SIGCONT)
+        thread.join(timeout=10)
+
+        status, body = holder["status"], holder["body"]
+        self.assertEqual(status, 409, body)
+        self.assertTrue(body["retry"], body)
+        self.assertIn("重查", body["error"])
+        self.assertGreater(self.session.mutation_epoch(), epoch_before)
+        # The query never took the job lock: the rebind ran through.
+        self.assertEqual(self.bindings(), target)
+
+        # After the sample catches up, a fresh query must succeed again and
+        # never return the late reply of the interrupted query.
+        status, body = self._query(name)
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body["ok"], body)
+        self.assertTrue(body["consistent"], body)
+        self.assertEqual(body["cpus"], target[name])
+
+    def test_rollback_started_while_waiting_forces_requery_too(self):
+        if not hasattr(signal, "SIGSTOP"):
+            self.skipTest("平台不支持 SIGSTOP")
+        original = self.bindings()
+        names = sorted(original)
+        # 3-cycle with an injected fault: writes happen, then rollback to the
+        # original cores — exactly the "回退到原核同样处理" window.
+        target = dict(original)
+        for index, sample_name in enumerate(names):
+            target[sample_name] = original[names[(index + 1) % len(names)]]
+        stalled = names[0]
+        pid = self.session.set.samples[stalled].pid
+
+        os.kill(pid, signal.SIGSTOP)
+        try:
+            holder = {}
+
+            def run_query():
+                holder["status"], holder["body"] = self._query(stalled)
+
+            thread = threading.Thread(target=run_query)
+            thread.start()
+            sample = self.session.set.samples[stalled]
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and not sample._ask_lock.locked():
+                time.sleep(0.01)
+            self.assertTrue(sample._ask_lock.locked())
+
+            job = self.session.submit(target, fail_at=2)
+        finally:
+            os.kill(pid, signal.SIGCONT)
+        thread.join(timeout=10)
+
+        self.assertEqual(job.result, "rolled_back", job.error)
+        status, body = holder["status"], holder["body"]
+        self.assertEqual(status, 409, body)
+        self.assertTrue(body["retry"])
+        self.assertIn("重查", body["error"])
+        # Rollback restored the original binding; a fresh query confirms it.
+        self.assertEqual(self.bindings(), original)
+        status, body = self._query(stalled)
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body["consistent"], body)
+        self.assertEqual(body["cpus"], original[stalled])
+
+    def test_sample_timeout_keeps_timeout_prompt_and_recovers(self):
+        if not hasattr(signal, "SIGSTOP"):
+            self.skipTest("平台不支持 SIGSTOP")
+        name = self.names[0]
+        pid = self.session.set.samples[name].pid
+        os.kill(pid, signal.SIGSTOP)
+        try:
+            start = time.monotonic()
+            status, body = self._query(name)
+            elapsed = time.monotonic() - start
+        finally:
+            os.kill(pid, signal.SIGCONT)
+        self.assertEqual(status, 503, body)
+        self.assertTrue(body["retry"])
+        self.assertIn("超时", body["error"])
+        self.assertLess(elapsed, 4.0)
+        # Give the sample a moment to process its backlog, then re-query.
+        deadline = time.monotonic() + 5
+        recovered = False
+        while time.monotonic() < deadline:
+            status, body = self._query(name)
+            if status == 200:
+                recovered = True
+                break
+            time.sleep(0.2)
+        self.assertTrue(recovered, body)
+
+    def test_late_reply_of_timed_out_query_is_not_reused(self):
+        if not hasattr(signal, "SIGSTOP"):
+            self.skipTest("平台不支持 SIGSTOP")
+        name = self.names[0]
+        sample = self.session.set.samples[name]
+        pid = sample.pid
+        os.kill(pid, signal.SIGSTOP)
+        try:
+            status, first = self._query(name)
+        finally:
+            os.kill(pid, signal.SIGCONT)
+        self.assertEqual(status, 503, first)
+        # Drain the late reply that the stopped sample emits on resume, then
+        # prove the next request gets a fresh correlated answer rather than
+        # the stale one.
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            status, body = self._query(name)
+            if status == 200:
+                break
+            time.sleep(0.2)
+        self.assertEqual(status, 200, body)
+        self.assertIn("req_id", body)
+        self.assertTrue(body["consistent"])
 
 
 if __name__ == "__main__":

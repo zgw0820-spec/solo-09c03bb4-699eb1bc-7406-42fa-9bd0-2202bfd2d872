@@ -114,6 +114,12 @@ class Session:
         self.set = SampleSet(sample_count, pool)
         self._job_lock = threading.Lock()
         self._executing = False
+        # Bumped exactly when a job starts touching affinity (including the
+        # rollback phase, which runs inside the same job).  Sample queries
+        # snapshot it and ask the operator to re-query when it changes while
+        # their two read paths are being collected.
+        self._epoch_lock = threading.Lock()
+        self._mutation_epoch = 0
         self._job_counter = itertools.count(1)
         self.jobs: list[JobRecord] = []
         self.started_at: float | None = None
@@ -232,6 +238,22 @@ class Session:
     @property
     def executing(self) -> bool:
         return self._executing
+
+    def mutation_epoch(self) -> int:
+        """Monotonic counter of affinity-writing job starts.
+
+        A sample query snapshots this before its first read and compares it
+        after its last read: any change means a rebind (or its rollback)
+        overlapped the query and the two read paths may straddle the change.
+        """
+
+        with self._epoch_lock:
+            return self._mutation_epoch
+
+    def _begin_mutations(self) -> int:
+        with self._epoch_lock:
+            self._mutation_epoch += 1
+            return self._mutation_epoch
 
     def submit(self, raw_target: dict[str, str], fail_at: int | None = None) -> JobRecord:
         """Run one rebind group synchronously and return its record.
@@ -358,6 +380,11 @@ class Session:
         original = {name: next(iter(cpus)) for name, cpus in live.items()}
         steps: list[StepRecord] = []
         failure: str | None = None
+
+        # From here on this job may write affinity (the rollback phase shares
+        # this epoch).  Any sample query whose two reads straddle this point
+        # must be answered with "please re-query" instead of a torn pair.
+        self._begin_mutations()
 
         for index, move in enumerate(plan.moves, start=1):
             if fail_at == index:
